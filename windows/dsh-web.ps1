@@ -453,6 +453,62 @@ public class DshChoiceCard : DshSplashForm {
         base.Dispose(disposing);
     }
 }
+// Reports - by creating a file - the first moment a TCP port accepts a
+// connection, without blocking the caller.
+//
+// The launcher's start loop used to call its own blocking probe once per half
+// second, and because a closed port does not refuse instantly on Windows each
+// call burned the whole timeout: measured at ~520 ms, so the progress card froze
+// for about half of every second.
+//
+// A single background thread does the polling and writes the file itself. It
+// must not call back into PowerShell: a callback would run on a thread with no
+// runspace, so any scriptblock doing the work would fail silently.
+public class DshPortWatcher {
+    private readonly int port;
+    private readonly string flagPath;
+    private volatile bool stopped;
+
+    public DshPortWatcher(int portToWatch, string pathToCreate) {
+        port = portToWatch;
+        flagPath = pathToCreate;
+    }
+
+    public void Start() {
+        System.Threading.Thread thread = new System.Threading.Thread(Loop);
+        thread.IsBackground = true;
+        thread.Start();
+    }
+
+    public void Stop() {
+        stopped = true;
+    }
+
+    private void Loop() {
+        while (!stopped) {
+            System.Net.Sockets.TcpClient client = new System.Net.Sockets.TcpClient();
+            try {
+                // A short timeout keeps the retry interval small: an open port
+                // connects in about a millisecond.
+                System.IAsyncResult pending = client.BeginConnect("127.0.0.1", port, null, null);
+                if (pending.AsyncWaitHandle.WaitOne(200, false)) {
+                    try {
+                        client.EndConnect(pending);
+                        if (!stopped) { System.IO.File.WriteAllText(flagPath, "ready"); }
+                        return;
+                    } catch {
+                        // Refused: the server is not listening yet.
+                    }
+                }
+            } catch {
+                // Treated the same as a refused connection.
+            } finally {
+                try { client.Close(); } catch { }
+            }
+            System.Threading.Thread.Sleep(40);
+        }
+    }
+}
 '@
 
 function Initialize-CardTypes {
@@ -853,8 +909,8 @@ Write-Log "start: $($dsh.Node) $($startArgs -join ' ') (cwd $Workspace)"
 # moment, and creating a new process that redirects into them fails while it
 # does. Retry instead of reporting a failure that clears up by itself.
 $process = $null
+Remove-Item $OutFile, $ErrFile -ErrorAction SilentlyContinue
 for ($attempt = 1; $attempt -le 15 -and -not $process; $attempt++) {
-    Remove-Item $OutFile, $ErrFile -ErrorAction SilentlyContinue
     try {
         $process = Start-Process -FilePath $dsh.Node `
             -ArgumentList $startArgs `
@@ -876,34 +932,64 @@ if (-not $process) {
 }
 Write-Log "start: launched PID $($process.Id)"
 
+# Watch for the port on another thread, so the loop below never blocks. See
+# DshPortWatcher: the old inline probe cost ~520 ms per call and made the
+# progress card stutter.
+$readyFlag = Join-Path $env:TEMP "dsh-web-ready-$Port-$PID.flag"
+Remove-Item $readyFlag -ErrorAction SilentlyContinue
+$watcher = New-Object DshPortWatcher -ArgumentList $Port, $readyFlag
+$watcher.Start()
+
 $startedAt = Get-Date
 $deadline = $startedAt.AddSeconds(45)
+$lastSecond = -1
+$portReady = $false
 while ((Get-Date) -lt $deadline) {
     $waited = [int]((Get-Date) - $startedAt).TotalSeconds
     if (-not $script:Splash -and ($splashVisible -or $waited -ge $SplashDelaySeconds)) { Initialize-Splash }
-    # On a restart the card is already up and reads "Restarting": leave it alone
-    # for the first second, then switch to the plain elapsed count.
-    if (-not $restarting -or $waited -ge 1) { Set-Splash 'Starting the server' "${waited}s" }
-    if (Test-PortOpen $Port) { break }
+    # Only touch the card when the text changes: it is animated by its own timer.
+    if ($waited -ne $lastSecond -and (-not $restarting -or $waited -ge 1)) {
+        $lastSecond = $waited
+        Set-Splash 'Starting the server' "${waited}s"
+    }
+    if (Test-Path $readyFlag) { $portReady = $true; break }
     if ($process.HasExited) { break }
-    Wait-Pumping 500
+    Wait-Pumping 100
 }
+$watcher.Stop()
+Remove-Item $readyFlag -ErrorAction SilentlyContinue
 
-if (Test-PortOpen $Port) {
-    # The URL line is printed once the loader tree settles, a moment after the
-    # bind; wait for it and keep it for later reuse clicks.
+if ($portReady) {
+    # Wait for the authenticated URL line, which dsh prints a moment after it
+    # binds. Read only what is new since the last look instead of re-scanning the
+    # whole file twice a second.
     $handoffUrl = ''
     $urlDeadline = (Get-Date).AddSeconds(25)
+    $readFrom = 0L
+    $lastSecond = -1
     while ((Get-Date) -lt $urlDeadline -and -not $handoffUrl) {
         $waited = [int]((Get-Date) - $startedAt).TotalSeconds
-        Set-Splash 'Waiting for the interface' "${waited}s"
+        if ($waited -ne $lastSecond) {
+            $lastSecond = $waited
+            Set-Splash 'Waiting for the interface' "${waited}s"
+        }
         if (Test-Path $OutFile) {
             try {
-                $found = Select-String -Path $OutFile -Pattern 'dsh web:\s+(\S+)' -ErrorAction Stop | Select-Object -First 1
-                if ($found) { $handoffUrl = $found.Matches[0].Groups[1].Value }
+                $stream = [System.IO.File]::Open($OutFile, 'Open', 'Read', 'ReadWrite')
+                try {
+                    if ($stream.Length -gt $readFrom) {
+                        [void]$stream.Seek($readFrom, 'Begin')
+                        $buffer = New-Object byte[] ($stream.Length - $readFrom)
+                        $read = $stream.Read($buffer, 0, $buffer.Length)
+                        $readFrom += $read
+                        $chunk = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $read)
+                        $found = [regex]::Match($chunk, 'dsh web:\s+(\S+)')
+                        if ($found.Success) { $handoffUrl = $found.Groups[1].Value }
+                    }
+                } finally { $stream.Close() }
             } catch { }
         }
-        if (-not $handoffUrl) { Wait-Pumping 400 }
+        if (-not $handoffUrl) { Wait-Pumping 100 }
     }
     if ($handoffUrl) {
         try { Set-Content -Path $UrlFile -Value $handoffUrl -Encoding ASCII } catch { }
