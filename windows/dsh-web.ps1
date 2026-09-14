@@ -49,6 +49,15 @@ $OutFile = Join-Path $LogDir 'dsh-web.out.log'
 $ErrFile = Join-Path $LogDir 'dsh-web.err.log'
 $UrlFile = Join-Path $LogDir 'current-url.txt'
 
+# The launcher normally runs hidden, so an uncaught error looks to the user like
+# a window that flashed and vanished. Write it down before dying: without this
+# there is nothing at all to diagnose from.
+trap {
+    $detail = "$($_.Exception.Message) at $($_.InvocationInfo.PositionMessage)"
+    try { Add-Content -Path $LogFile -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') unhandled: $detail" -Encoding UTF8 } catch { }
+    exit 1
+}
+
 # The installer records the port and workspace it was configured with, so a
 # bare invocation - the uninstaller, or someone running the script by hand -
 # behaves exactly like the shortcuts do. Explicit parameters still win.
@@ -276,58 +285,50 @@ public class DshChoiceCard : DshSplashForm {
         StartPosition = FormStartPosition.CenterScreen;
         TopMost = true;
         ShowInTaskbar = true;
-        ClientSize = new Size(468, 224);
+        ClientSize = new Size(468, 200);
         BackColor = Color.FromArgb(23, 26, 36);
         KeyPreview = true;
 
-        DshWaitCard card = new DshWaitCard();
-        card.Dock = DockStyle.Fill;
-        card.BackColor = BackColor;
-        card.SetText("", "");
-        Controls.Add(card);
-
-        // The question is the card's own text: the card is a brand header there,
-        // and repeating "DeepSeek Harness" underneath it read as a glitch.
-        Label question = new Label();
-        question.Text = "Restart the server, or open another window?";
-        question.Font = new Font("Segoe UI", 10f);
-        question.ForeColor = Color.FromArgb(226, 232, 246);
-        question.BackColor = Color.Transparent;
-        question.AutoSize = true;
-        question.Location = new Point(28, 112);
+        // Text is drawn straight onto the form: the splash-style card brought a
+        // progress bar along with it, and a bar in a question dialog implies the
+        // dialog is working on something when it is only waiting to be answered.
+        Label title = MakeLabel("DeepSeek Harness", 12f, FontStyle.Bold, Color.White, 28, 22);
+        Controls.Add(title);
+        Label question = MakeLabel("Restart the server, or open another window?", 10f, FontStyle.Regular,
+            Color.FromArgb(226, 232, 246), 28, 60);
         Controls.Add(question);
-        question.BringToFront();
+        Label hint = MakeLabel("Restart closes the running server first, then starts it again.", 9f,
+            FontStyle.Regular, Color.FromArgb(140, 152, 180), 28, 84);
+        Controls.Add(hint);
 
+        // Below the buttons and added last: drawn across the whole width it used
+        // to sit under them and was partly hidden by the middle button.
         status.Font = new Font("Segoe UI", 9f);
-        status.ForeColor = Color.FromArgb(166, 176, 202);
+        status.ForeColor = Color.FromArgb(140, 152, 180);
         status.BackColor = Color.Transparent;
         status.AutoSize = false;
         status.TextAlign = ContentAlignment.MiddleCenter;
-        status.Location = new Point(0, 192);
+        status.Location = new Point(0, 164);
         status.Size = new Size(468, 20);
         Controls.Add(status);
-        status.BringToFront();
 
-        Button restart = MakeButton("Restart server", 28, 148, 138);
+        Button restart = MakeButton("Restart server", 28, 116, 138);
         restart.BackColor = Color.FromArgb(111, 155, 255);
         restart.ForeColor = Color.FromArgb(16, 20, 32);
         restart.Click += delegate { Answer(Restart); };
         Controls.Add(restart);
-        restart.BringToFront();
 
-        Button open = MakeButton("New window", 174, 148, 128);
+        Button open = MakeButton("New window", 174, 116, 128);
         open.BackColor = Color.FromArgb(43, 49, 69);
         open.ForeColor = Color.FromArgb(226, 232, 246);
         open.Click += delegate { Answer(Open); };
         Controls.Add(open);
-        open.BringToFront();
 
-        Button cancel = MakeButton("Cancel", 310, 148, 100);
+        Button cancel = MakeButton("Cancel", 310, 116, 100);
         cancel.BackColor = Color.FromArgb(43, 49, 69);
         cancel.ForeColor = Color.FromArgb(166, 176, 202);
         cancel.Click += delegate { Answer(Cancel); };
         Controls.Add(cancel);
-        cancel.BringToFront();
 
         // Restart is the default: a repeat click usually follows a plugin change.
         AcceptButton = restart;
@@ -360,6 +361,17 @@ public class DshChoiceCard : DshSplashForm {
         button.Size = new Size(width, 32);
         button.TabStop = true;
         return button;
+    }
+
+    private static Label MakeLabel(string caption, float size, FontStyle style, Color colour, int x, int y) {
+        Label label = new Label();
+        label.Text = caption;
+        label.Font = new Font("Segoe UI", size, style);
+        label.ForeColor = colour;
+        label.BackColor = Color.Transparent;
+        label.AutoSize = true;
+        label.Location = new Point(x, y);
+        return label;
     }
 
     private void Answer(int choice) {
@@ -502,8 +514,12 @@ function Initialize-Splash {
 
         $form.Show()
         [System.Windows.Forms.Application]::DoEvents()
+        # Detail must exist from the start: Set-Splash assigns it, and a
+        # PSCustomObject rejects a property it was not created with. Leaving it
+        # out made every Set-Splash call throw, which killed the launcher right
+        # after the card appeared and before it stopped anything.
         $script:Splash = [pscustomobject]@{
-            Form = $form; Card = $card; Started = (Get-Date)
+            Form = $form; Card = $card; Detail = ''; Started = (Get-Date)
         }
     } catch {
         Write-Log "splash: unavailable ($($_.Exception.Message))"
@@ -519,7 +535,6 @@ function Set-Splash([string]$Headline, [string]$Detail) {
     $script:Splash.Detail = $Detail
     try { $script:Splash.Card.SetText($Headline, $Detail) } catch { }
 }
-
 # The runner is animated by the control's own timer, so this only has to keep
 # WinForms pumping: no DoEvents storm, and no per-slice position arithmetic.
 function Wait-Pumping([int]$Milliseconds) {
@@ -650,6 +665,54 @@ if ($Check) {
 }
 
 # --- stop --------------------------------------------------------------------
+# The process holding the port, or $null when nothing does. Used both to decide
+# whether the running server is ours and to report a refusal.
+function Get-PortOwnerProcess([int]$P) {
+    $holder = Get-PortOwner $P
+    if ($holder -le 0) { return $null }
+    return Get-Process -Id $holder -ErrorAction SilentlyContinue
+}
+
+# Is the thing on the port really a dsh server?
+#
+# The port owner decides, not the HTTP probe: a dsh server that is busy answers
+# no request at all, and treating that timeout as "some other program" made the
+# restart give up and refuse to stop the very server it was asked to restart.
+#   - owner is not node            -> 'foreign'  (never touch it)
+#   - HTTP answers 401 or 403      -> 'dsh'      (dsh without a browser cookie)
+#   - HTTP answers anything else   -> 'foreign'  (a node program, but not dsh)
+#   - no answer / timed out        -> 'dsh' if the owner is node, else 'foreign'
+#
+# Returns the verdict plus the owner's process name so callers can say what they
+# found without looking it up again.
+function Probe-DshServer([int]$P) {
+    $proc = Get-PortOwnerProcess $P
+    if (-not $proc) { return [pscustomobject]@{ IsDsh = $false; ProcessName = '<none>'; Detail = 'no process holds the port' } }
+    $name = $proc.ProcessName
+    if ($name -ne 'node') {
+        return [pscustomobject]@{ IsDsh = $false; ProcessName = $name; Detail = "held by $name, not node" }
+    }
+    $status = 0
+    $note = ''
+    try {
+        $response = Invoke-WebRequest "http://127.0.0.1:$P/" -UseBasicParsing -TimeoutSec 5
+        $status = [int]$response.StatusCode
+        $note = "answered $status"
+    } catch {
+        $response = $_.Exception.Response
+        if ($response) {
+            $status = [int]$response.StatusCode
+            $note = "answered $status"
+        } else {
+            $note = "no answer ($($_.Exception.Message))"
+        }
+    }
+    if ($status -eq 401 -or $status -eq 403) { return [pscustomobject]@{ IsDsh = $true; ProcessName = $name; Detail = $note } }
+    if ($status -gt 0) { return [pscustomobject]@{ IsDsh = $false; ProcessName = $name; Detail = $note } }
+    # A node process that did not answer is the dsh server under load: still ours.
+    return [pscustomobject]@{ IsDsh = $true; ProcessName = $name; Detail = "$note; owner is node" }
+}
+
 # Stops the dsh server listening on $Port, and waits for the port to actually
 # come free before returning. Returns 'stopped', 'notrunning' or 'blocked'.
 function Stop-DshServer {
@@ -710,22 +773,10 @@ if ($running) {
     $action = Ask-Action $Port
     if ($action -eq 'cancel') { Write-Log 'ask: user chose to do nothing'; exit 0 }
 
-    $isDsh = $false
-    try {
-        $response = Invoke-WebRequest $Url -UseBasicParsing -TimeoutSec 5
-        Write-Log "probe: port $Port answered $([int]$response.StatusCode); not a dsh server"
-    } catch {
-        $response = $_.Exception.Response
-        if ($response) {
-            $code = [int]$response.StatusCode
-            if ($code -eq 401 -or $code -eq 403) { $isDsh = $true }
-            else { Write-Log "probe: port $Port answered $code; not a dsh server" }
-        } else {
-            Write-Log "probe: port $Port probe failed: $($_.Exception.Message)"
-        }
-    }
-    if (-not $isDsh) {
-        Write-Log "reuse: port $Port is taken by another program (PID $owner)"
+    $probe = Probe-DshServer $Port
+    Write-Log "probe: port $Port -> dsh=$($probe.IsDsh) ($($probe.Detail))"
+    if (-not $probe.IsDsh) {
+        Write-Log "reuse: port $Port is taken by $($probe.ProcessName) (PID $owner)"
         Show-Message "Port $Port is already used by another program (PID $owner), so DSH Web cannot start.`r`n`r`nClose that program, or start this launcher with another -Port." 'DSH Web' 16 45
         exit 1
     }
@@ -738,14 +789,25 @@ if ($running) {
 
     if ($action -eq 'restart') {
         Write-Log "restart: stopping the server on port $Port"
-        # Show the card up front: the stop alone takes a second or more, and
-        # waiting for the usual 2s delay would leave the click unanswered.
-        Initialize-Splash
-        $splashVisible = $true
-        Set-Splash 'Restarting the server' ''
-        if ((Stop-DshServer) -eq 'blocked') {
+        # Every step is logged: this path used to stop silently right after the
+        # card appeared, and without a trace there was nothing to go on.
+        try {
+            Initialize-Splash
+            Write-Log 'restart: splash ready'
+            $splashVisible = $true
+            Set-Splash 'Restarting the server' ''
+            $outcome = Stop-DshServer
+            Write-Log "restart: stop outcome '$outcome'"
+            if ($outcome -eq 'blocked') {
+                Close-Splash
+                Show-Message "Could not stop the dsh server on port $Port.`r`n`r`nEnd PID $owner in Task Manager and try again." 'DSH Web' 48 30
+                exit 1
+            }
+        } catch {
+            Write-Log "restart: FAILED after splash - $($_.Exception.Message)"
+            Write-Log "restart: at $($_.InvocationInfo.PositionMessage)"
             Close-Splash
-            Show-Message "Could not stop the dsh server on port $Port.`r`n`r`nEnd PID $owner in Task Manager and try again." 'DSH Web' 48 30
+            Show-Message "Restarting dsh web failed:`r`n$($_.Exception.Message)" 'DSH Web' 16 45
             exit 1
         }
         $restarting = $true
@@ -786,22 +848,33 @@ $startArgs = @($dsh.Bin, 'web', '--port', "$Port")
 # dump the URL into the default browser.
 if ($NoBrowser -or $browser) { $startArgs += '--no-open' }
 Write-Log "start: $($dsh.Node) $($startArgs -join ' ') (cwd $Workspace)"
-Remove-Item $OutFile, $ErrFile -ErrorAction SilentlyContinue
 
-try {
-    $process = Start-Process -FilePath $dsh.Node `
-        -ArgumentList $startArgs `
-        -WorkingDirectory $Workspace `
-        -WindowStyle Hidden `
-        -RedirectStandardOutput $OutFile `
-        -RedirectStandardError $ErrFile `
-        -PassThru
-} catch {
-    Write-Log "error: could not start dsh: $($_.Exception.Message)"
+# The process that just died still holds the previous stdout/stderr files for a
+# moment, and creating a new process that redirects into them fails while it
+# does. Retry instead of reporting a failure that clears up by itself.
+$process = $null
+for ($attempt = 1; $attempt -le 15 -and -not $process; $attempt++) {
+    Remove-Item $OutFile, $ErrFile -ErrorAction SilentlyContinue
+    try {
+        $process = Start-Process -FilePath $dsh.Node `
+            -ArgumentList $startArgs `
+            -WorkingDirectory $Workspace `
+            -WindowStyle Hidden `
+            -RedirectStandardOutput $OutFile `
+            -RedirectStandardError $ErrFile `
+            -PassThru
+    } catch {
+        Write-Log "start: attempt $attempt failed - $($_.Exception.Message)"
+        Start-Sleep -Milliseconds 300
+    }
+}
+if (-not $process) {
+    Write-Log 'error: could not start dsh after 15 attempts'
     Close-Splash
-    Show-Message "Starting dsh web failed:`r`n$($_.Exception.Message)" 'DSH Web' 16 45
+    Show-Message "Starting dsh web failed: the previous server's log files stayed locked.`r`n`r`nTry again in a moment." 'DSH Web' 16 45
     exit 1
 }
+Write-Log "start: launched PID $($process.Id)"
 
 $startedAt = Get-Date
 $deadline = $startedAt.AddSeconds(45)
