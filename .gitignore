@@ -1,0 +1,18 @@
+# logs written by the Windows launcher
+logs/
+*.log
+
+# local test runs
+tests-run/
+
+# editor / OS noise
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*.lnk
+
+# node
+node_modules/
+npm-debug.log*
+pnpm-debug.log*

@@ -1,0 +1,21 @@
+# dsh-web-desktop bundle patch: the Web profile opens the GUI in a Chrome app
+# window instead of handing the URL to the system default browser.
+#
+# A patch replaces the targeted row's whole `config`, so the `web-runtime` row
+# below restates every key the web bundle gives it, changing only openBrowser.
+# `printUrl` stays on: the launcher parses that URL line out of stdout.
+
+- id: web-runtime
+  config:
+    openBrowser: false
+    printUrl: true
+    surfaceContext: true
+    trustedHosts: !!js ctx.webStartup.trustedHosts
+
+- insert:
+    # Opens the app window itself once the tree has settled. The row injects
+    # `webStartup` so it can honour `dsh web --no-open` (the Windows launcher
+    # passes that flag and opens the window on its own instead).
+    - id: web-desktop
+      name: 'dsh-web-desktop'
+      inject: [webStartup]
