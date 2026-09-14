@@ -71,9 +71,13 @@ $shell = New-Object -ComObject WScript.Shell
 $shortcuts = @()
 if ($startMenu) {
     $shortcuts += (Join-Path $startMenu 'DSH Web.lnk')
+    $shortcuts += (Join-Path $startMenu 'DSH Web (Restart).lnk')
     $shortcuts += (Join-Path $startMenu 'DSH Web (Stop).lnk')
 }
-if ($desktop) { $shortcuts += (Join-Path $desktop 'DSH Web.lnk') }
+if ($desktop) {
+    $shortcuts += (Join-Path $desktop 'DSH Web.lnk')
+    $shortcuts += (Join-Path $desktop 'DSH Web (Restart).lnk')
+}
 
 foreach ($shortcut in $shortcuts) {
     if (-not (Test-Path $shortcut)) { continue }

@@ -2,6 +2,7 @@
     dsh-web-desktop launcher (Windows).
 
       dsh-web.ps1                 start dsh web in the background, then open the GUI
+      dsh-web.ps1 -Restart        stop the running server first, then start it again
       dsh-web.ps1 -Stop           stop the dsh web server listening on the port
       dsh-web.ps1 -Check          print diagnostics only, change nothing
 
@@ -16,6 +17,7 @@
 [CmdletBinding()]
 param(
     [switch]$Stop,
+    [switch]$Restart,
     [switch]$Check,
     [switch]$NoBrowser,
     [switch]$NoAppMode,
@@ -76,12 +78,17 @@ function Initialize-Splash {
     try {
         Add-Type -AssemblyName System.Windows.Forms
         Add-Type -AssemblyName System.Drawing
-        if (-not ('DshSplashForm' -as [type])) {
+        if (-not ('DshSplashForm' -as [type]) -or -not ('DshWaitCard' -as [type])) {
             # WinForms gives no property for these two: without them the card
             # would steal focus from whatever the user is typing in, and would
             # add a taskbar button of its own.
             Add-Type -ReferencedAssemblies 'System.Windows.Forms', 'System.Drawing' -TypeDefinition @'
+using System;
+using System.Diagnostics;
+using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.Windows.Forms;
+
 public class DshSplashForm : Form {
     protected override bool ShowWithoutActivation { get { return true; } }
     protected override CreateParams CreateParams {
@@ -93,12 +100,125 @@ public class DshSplashForm : Form {
         }
     }
 }
+
+// The whole progress card is drawn by this one control, and animated by its own
+// timer, so the runner sweeps at display rate. It must not depend on PowerShell
+// pumping messages: a launcher that is busy probing a TCP port or waiting on a
+// process cannot paint often enough, and a slider that only moves when the
+// script gets around to it looks like it stalls once a second.
+public class DshWaitCard : Control {
+    private readonly Timer tick = new Timer();
+    private readonly Stopwatch clock = Stopwatch.StartNew();
+    private readonly string[] shimmer = new string[] { ".", "..", "..." };
+    private string line1 = "";
+    private string line2 = "";
+    private int shimmerStep;
+
+    public DshWaitCard() {
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint
+               | ControlStyles.OptimizedDoubleBuffer | ControlStyles.Opaque
+               | ControlStyles.ResizeRedraw, true);
+        tick.Interval = 16; // ~60 fps
+        tick.Tick += delegate { shimmerStep++; Invalidate(); };
+        tick.Start();
+    }
+
+    // line1 is the steady headline; line2 changes rarely (the elapsed seconds),
+    // so repaints stay cheap.
+    public void SetText(string first, string second) {
+        if (first == null) first = "";
+        if (second == null) second = "";
+        if (first == line1 && second == line2) return;
+        line1 = first;
+        line2 = second;
+        Invalidate();
+    }
+
+    protected override void OnPaint(PaintEventArgs e) {
+        Graphics g = e.Graphics;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        g.Clear(this.BackColor);
+
+        // The logo is a child control parked at x=28..86, so every string starts
+        // to the right of it: the previous revision drew the headline from x=26
+        // and the icon sat on top of the "De".
+        int left = 100;
+        int right = 28;
+
+        using (SolidBrush fg = new SolidBrush(Color.White))
+        using (SolidBrush dim = new SolidBrush(Color.FromArgb(166, 176, 202)))
+        using (Font bold = new Font("Segoe UI", 13f, FontStyle.Bold))
+        using (Font small = new Font("Segoe UI", 9f)) {
+            g.DrawString("DeepSeek Harness", bold, fg, left, 32);
+            g.DrawString(line1 + shimmer[shimmerStep % 3], small, dim, left + 1, 66);
+        }
+
+        int trackY = 96;
+        int trackH = 5;
+        int trackX = left;
+        int trackW = this.ClientSize.Width - trackX - right;
+        if (trackW < 32) trackW = 32;
+        using (GraphicsPath track = Rounded(new RectangleF(trackX, trackY, trackW, trackH), trackH / 2f))
+        using (SolidBrush trackBrush = new SolidBrush(Color.FromArgb(43, 49, 69)))
+        using (Pen trackEdge = new Pen(Color.FromArgb(60, 68, 94))) {
+            g.FillPath(trackBrush, track);
+            g.DrawPath(trackEdge, track);
+        }
+
+        int runnerW = 92;
+        if (runnerW > trackW) runnerW = trackW;
+        // Ping-pong the runner instead of wrapping it: the smoothstep easing
+        // eases in and out at both edges, so there is no visible jump when it
+        // turns around. One sweep takes 1.5s.
+        double phase = (clock.Elapsed.TotalSeconds % 1.5) / 1.5;
+        double eased = phase < 0.5 ? 2 * phase * phase : 1 - 2 * (1 - phase) * (1 - phase);
+        RectangleF runnerRect = new RectangleF(
+            trackX + (float)(eased * (trackW - runnerW)), trackY, runnerW, trackH);
+        // A soft halo wider than the bar, drawn first: it reads as motion at a
+        // glance even when a single frame is on screen.
+        using (GraphicsPath halo = Rounded(new RectangleF(runnerRect.X - 5, trackY - 4, runnerW + 10, trackH + 8), (trackH + 8) / 2f))
+        using (SolidBrush haloBrush = new SolidBrush(Color.FromArgb(34, 111, 155, 255))) {
+            g.FillPath(haloBrush, halo);
+        }
+        using (GraphicsPath runner = Rounded(runnerRect, trackH / 2f))
+        using (LinearGradientBrush runnerBrush = new LinearGradientBrush(
+                   new RectangleF(runnerRect.X, trackY, runnerW, trackH),
+                   Color.FromArgb(126, 168, 255), Color.FromArgb(86, 126, 240), 0f)) {
+            g.FillPath(runnerBrush, runner);
+        }
+
+        if (line2.Length > 0) {
+            using (SolidBrush dim2 = new SolidBrush(Color.FromArgb(112, 124, 152)))
+            using (Font tiny = new Font("Segoe UI", 8f)) {
+                SizeF size = g.MeasureString(line2, tiny);
+                g.DrawString(line2, tiny, dim2, this.ClientSize.Width - right - size.Width, trackY + 10);
+            }
+        }
+    }
+
+    private static GraphicsPath Rounded(RectangleF r, float radius) {
+        GraphicsPath path = new GraphicsPath();
+        if (radius < 0.5f) { path.AddRectangle(r); return path; }
+        float d = radius * 2f;
+        path.AddArc(r.X, r.Y, d, d, 180, 90);
+        path.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+        path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+        path.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+        path.CloseFigure();
+        return path;
+    }
+
+    protected override void Dispose(bool disposing) {
+        if (disposing) { tick.Stop(); tick.Dispose(); }
+        base.Dispose(disposing);
+    }
+}
 '@
         }
         try { [System.Windows.Forms.Application]::EnableVisualStyles() } catch { }
 
         $width = 384
-        $height = 136
+        $height = 150
         $form = New-Object DshSplashForm
         $form.Text = 'DSH Web'
         $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
@@ -117,55 +237,30 @@ public class DshSplashForm : Form {
         $region.CloseFigure()
         $form.Region = New-Object System.Drawing.Region -ArgumentList $region
 
-        $font = 'Segoe UI'
         $logo = Join-Path $Root 'dsh-web.png'
         if (Test-Path $logo) {
             $picture = New-Object System.Windows.Forms.PictureBox
             $picture.Image = [System.Drawing.Image]::FromFile($logo)
             $picture.SizeMode = [System.Windows.Forms.PictureBoxSizeMode]::Zoom
-            $picture.Location = New-Object System.Drawing.Point -ArgumentList 26, 40
+            $picture.Location = New-Object System.Drawing.Point -ArgumentList 28, 34
             $picture.Size = New-Object System.Drawing.Size -ArgumentList 58, 58
             $form.Controls.Add($picture)
             $picture.BackColor = [System.Drawing.Color]::Transparent
         }
 
-        $title = New-Object System.Windows.Forms.Label
-        $title.Text = 'DeepSeek Harness'
-        $title.Font = New-Object System.Drawing.Font -ArgumentList $font, 13, ([System.Drawing.FontStyle]::Bold)
-        $title.ForeColor = [System.Drawing.Color]::White
-        $title.AutoSize = $true
-        $title.Location = New-Object System.Drawing.Point -ArgumentList 104, 30
-        $form.Controls.Add($title)
-        $title.BackColor = [System.Drawing.Color]::Transparent
-
-        $status = New-Object System.Windows.Forms.Label
-        $status.Text = 'Starting the server ...'
-        $status.Font = New-Object System.Drawing.Font -ArgumentList $font, 9
-        $status.ForeColor = [System.Drawing.Color]::FromArgb(166, 176, 202)
-        $status.AutoSize = $true
-        $status.Location = New-Object System.Drawing.Point -ArgumentList 106, 62
-        $form.Controls.Add($status)
-        $status.BackColor = [System.Drawing.Color]::Transparent
-
-        # A self-drawn runner instead of a ProgressBar: the themed control is a
-        # chunky green block that fights the dark card, and its own animation
-        # would need a real message pump anyway.
-        $track = New-Object System.Windows.Forms.Panel
-        $track.Size = New-Object System.Drawing.Size -ArgumentList 254, 4
-        $track.Location = New-Object System.Drawing.Point -ArgumentList 106, 94
-        $track.BackColor = [System.Drawing.Color]::FromArgb(43, 49, 69)
-        $form.Controls.Add($track)
-
-        $runner = New-Object System.Windows.Forms.Panel
-        $runner.Size = New-Object System.Drawing.Size -ArgumentList 64, 4
-        $runner.Location = New-Object System.Drawing.Point -ArgumentList -64, 0
-        $runner.BackColor = [System.Drawing.Color]::FromArgb(111, 155, 255)
-        $track.Controls.Add($runner)
+        # One control draws every string plus the runner, and animates the runner
+        # on its own timer. Separate labels would each repaint on their own
+        # schedule and flicker against the moving card.
+        $card = New-Object DshWaitCard
+        $card.Dock = [System.Windows.Forms.DockStyle]::Fill
+        $card.BackColor = [System.Drawing.Color]::FromArgb(23, 26, 36)
+        $form.Controls.Add($card)
+        $card.SetText('Starting the server', '')
 
         $form.Show()
         [System.Windows.Forms.Application]::DoEvents()
         $script:Splash = [pscustomobject]@{
-            Form = $form; Status = $status; Track = $track; Runner = $runner; Started = (Get-Date)
+            Form = $form; Card = $card; Started = (Get-Date)
         }
     } catch {
         Write-Log "splash: unavailable ($($_.Exception.Message))"
@@ -173,25 +268,22 @@ public class DshSplashForm : Form {
     }
 }
 
-function Update-Splash([string]$Text) {
+# The headline is steady; the caption underneath carries the elapsed seconds.
+# Both only repaint when their text actually changes, which is what keeps the
+# card smooth while the launcher is busy probing the port.
+function Set-Splash([string]$Headline, [string]$Detail) {
     if (-not $script:Splash) { return }
-    try {
-        $splash = $script:Splash
-        $splash.Status.Text = $Text
-        # Travel one track-length every ~1.8s, wrapping around the right edge.
-        $span = $splash.Track.Width + $splash.Runner.Width
-        $phase = ((Get-Date) - $splash.Started).TotalSeconds * ($span / 1.8)
-        $splash.Runner.Left = [int]($phase % $span) - $splash.Runner.Width
-        [System.Windows.Forms.Application]::DoEvents()
-    } catch { }
+    $script:Splash.Detail = $Detail
+    try { $script:Splash.Card.SetText($Headline, $Detail) } catch { }
 }
 
-# Sleep that keeps the card painting and the runner moving.
+# The runner is animated by the control's own timer, so this only has to keep
+# WinForms pumping: no DoEvents storm, and no per-slice position arithmetic.
 function Wait-Pumping([int]$Milliseconds) {
     $end = (Get-Date).AddMilliseconds($Milliseconds)
     while ((Get-Date) -lt $end) {
-        if ($script:Splash) { Update-Splash $script:Splash.Status.Text }
-        Start-Sleep -Milliseconds 15
+        [System.Windows.Forms.Application]::DoEvents()
+        Start-Sleep -Milliseconds 25
     }
 }
 
@@ -315,26 +407,88 @@ if ($Check) {
 }
 
 # --- stop --------------------------------------------------------------------
-if ($Stop) {
-    if (-not $running) { Show-Message "DSH Web is not running (nothing is listening on port $Port)." 'DSH Web' 64 8; exit 0 }
-    $proc = Get-Process -Id $owner -ErrorAction SilentlyContinue
-    if (-not $proc) { Show-Message "Could not find the process holding port $Port (PID $owner)." 'DSH Web' 48 20; exit 1 }
+# Stops the dsh server listening on $Port, and waits for the port to actually
+# come free before returning. Returns 'stopped', 'notrunning' or 'blocked'.
+function Stop-DshServer {
+    if (-not (Test-PortOpen $Port)) { return 'notrunning' }
+    $holder = Get-PortOwner $Port
+    if ($holder -le 0) { return 'notrunning' }
+    $proc = Get-Process -Id $holder -ErrorAction SilentlyContinue
+    if (-not $proc) { return 'blocked' }
     # Never kill a stranger: only a node process may be the dsh server, and the
     # port might belong to something else entirely.
     if ($proc.ProcessName -ne 'node') {
-        Write-Log "stop: refused - port $Port is held by $($proc.ProcessName) (PID $owner), not node"
-        Show-Message "Port $Port is held by '$($proc.ProcessName)' (PID $owner), which is not a dsh server.`r`n`r`nNot stopping it." 'DSH Web' 48 25
-        exit 1
+        Write-Log "stop: refused - port $Port is held by $($proc.ProcessName) (PID $holder), not node"
+        return 'blocked'
     }
-    Write-Log "stop: killing PID $owner ($($proc.ProcessName))"
-    Stop-Process -Id $owner -Force
-    Start-Sleep -Milliseconds 1000
+    Write-Log "stop: killing PID $holder ($($proc.ProcessName))"
+    try { Stop-Process -Id $holder -Force } catch {
+        Write-Log "stop: Stop-Process failed: $($_.Exception.Message)"
+    }
+    # Wait for the socket to close instead of guessing with a fixed sleep: on a
+    # restart the new server cannot bind until the old one has let go.
+    for ($i = 0; $i -lt 100; $i++) {
+        if (-not (Test-PortOpen $Port)) { break }
+        Set-Splash 'Stopping the running server' ''
+        Start-Sleep -Milliseconds 100
+    }
     if (Test-PortOpen $Port) {
-        Show-Message "Port $Port is still in use - end PID $owner in Task Manager." 'DSH Web' 48 30
-        exit 1
+        Write-Log "stop: port $Port still listening after killing PID $holder"
+        return 'blocked'
     }
     Write-Log 'stop: done'
-    exit 0
+    return 'stopped'
+}
+
+if ($Stop) {
+    if (-not $running) { Show-Message "DSH Web is not running (nothing is listening on port $Port)." 'DSH Web' 64 8; exit 0 }
+    switch (Stop-DshServer) {
+        'stopped' { exit 0 }
+        'notrunning' { Show-Message "DSH Web is not running (nothing is listening on port $Port)." 'DSH Web' 64 8; exit 0 }
+        default {
+            Show-Message "Port $Port is held by a process that is not a dsh server (PID $owner).`r`n`r`nNot stopping it." 'DSH Web' 48 25
+            exit 1
+        }
+    }
+}
+
+# --- restart -----------------------------------------------------------------
+# What the desktop icon runs: stop whatever is serving the port, then start
+# again from scratch. This is the only way to pick up a plugin change without a
+# command line, so it must not require one.
+$restarting = $false
+if ($Restart -and $running) {
+    # Only restart our own server: a stranger on this port must never be killed.
+    $stillDsh = $false
+    try {
+        $probe = Invoke-WebRequest $Url -UseBasicParsing -TimeoutSec 5
+        Write-Log "restart: port $Port answered $([int]$probe.StatusCode); not a dsh server"
+    } catch {
+        $probeResponse = $_.Exception.Response
+        if ($probeResponse) {
+            $code = [int]$probeResponse.StatusCode
+            if ($code -eq 401 -or $code -eq 403) { $stillDsh = $true }
+            else { Write-Log "restart: port $Port answered $code; not a dsh server" }
+        }
+    }
+    if (-not $stillDsh) {
+        Write-Log "restart: refused - port $Port is taken by another program (PID $owner)"
+        Show-Message "Port $Port is already used by another program (PID $owner), so DSH Web cannot start.`r`n`r`nClose that program, or start this launcher with another -Port." 'DSH Web' 16 45
+        exit 1
+    }
+    Initialize-Splash
+    Set-Splash 'Restarting the server' ''
+    Write-Log "restart: stopping the server on port $Port"
+    if ((Stop-DshServer) -eq 'blocked') {
+        Close-Splash
+        Show-Message "Could not stop the dsh server on port $Port.`r`n`r`nEnd PID $owner in Task Manager and try again." 'DSH Web' 48 30
+        exit 1
+    }
+    $restarting = $true
+    # The port is free now, so the start path below must not take its
+    # "already running, just reuse it" branch.
+    $running = $false
+    $owner = 0
 }
 
 # --- start -------------------------------------------------------------------
@@ -410,8 +564,10 @@ $startedAt = Get-Date
 $deadline = $startedAt.AddSeconds(45)
 while ((Get-Date) -lt $deadline) {
     $waited = [int]((Get-Date) - $startedAt).TotalSeconds
-    if (-not $script:Splash -and $waited -ge $SplashDelaySeconds) { Initialize-Splash }
-    Update-Splash "Starting the server ... ${waited}s"
+    if (-not $script:Splash -and ($restarting -or $waited -ge $SplashDelaySeconds)) { Initialize-Splash }
+    # On a restart the card is already up and reads "Restarting": leave it alone
+    # for the first second, then switch to the plain elapsed count.
+    if (-not $restarting -or $waited -ge 1) { Set-Splash 'Starting the server' "${waited}s" }
     if (Test-PortOpen $Port) { break }
     if ($process.HasExited) { break }
     Wait-Pumping 500
@@ -424,7 +580,7 @@ if (Test-PortOpen $Port) {
     $urlDeadline = (Get-Date).AddSeconds(25)
     while ((Get-Date) -lt $urlDeadline -and -not $handoffUrl) {
         $waited = [int]((Get-Date) - $startedAt).TotalSeconds
-        Update-Splash "Waiting for the interface ... ${waited}s"
+        Set-Splash 'Waiting for the interface' "${waited}s"
         if (Test-Path $OutFile) {
             try {
                 $found = Select-String -Path $OutFile -Pattern 'dsh web:\s+(\S+)' -ErrorAction Stop | Select-Object -First 1
@@ -439,7 +595,7 @@ if (Test-PortOpen $Port) {
     } else {
         Write-Log "start: ready on $Url (PID $($process.Id)); the authenticated URL line never appeared"
     }
-    Update-Splash 'Opening the browser ...'
+    Set-Splash 'Opening the browser' ''
     if (-not $NoBrowser) {
         $openTarget = $Url
         if ($handoffUrl) { $openTarget = $handoffUrl }

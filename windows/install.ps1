@@ -13,6 +13,9 @@
       .\windows\install.ps1 -NoDesktopShortcut
       .\windows\uninstall.ps1                        remove everything again
 
+    Creates "DSH Web" (open) and "DSH Web (Restart)" (stop, then start again)
+    shortcuts, so restarting never needs a command line.
+
     Every string here is ASCII on purpose: Windows PowerShell 5.1 reads
     BOM-less .ps1 files as ANSI, so non-ASCII text would corrupt on machines
     whose code page differs.
@@ -117,10 +120,15 @@ function New-LauncherShortcut {
 
 if (-not $NoStartMenuShortcut) {
     New-LauncherShortcut -Path (Join-Path $startMenu 'DSH Web.lnk') -ExtraArgs '' -Description 'Open the DeepSeek Harness web GUI'
+    New-LauncherShortcut -Path (Join-Path $startMenu 'DSH Web (Restart).lnk') -ExtraArgs '-Restart' -Description 'Restart the DeepSeek Harness web server'
     New-LauncherShortcut -Path (Join-Path $startMenu 'DSH Web (Stop).lnk') -ExtraArgs '-Stop' -Description 'Stop the DeepSeek Harness web GUI'
 }
 if (-not $NoDesktopShortcut) {
     New-LauncherShortcut -Path (Join-Path $desktop 'DSH Web.lnk') -ExtraArgs '' -Description 'Open the DeepSeek Harness web GUI'
+    # A restart must be reachable without a command line: the plain icon only
+    # opens what is already running, so anyone who cannot run `dsh-web.ps1
+    # -Stop` would otherwise have no way to reload a changed plugin.
+    New-LauncherShortcut -Path (Join-Path $desktop 'DSH Web (Restart).lnk') -ExtraArgs '-Restart' -Description 'Restart the DeepSeek Harness web server'
 }
 
 # ---- smoke test --------------------------------------------------------------
@@ -135,13 +143,16 @@ try {
 
 # ---- what is left for the user ----------------------------------------------
 Write-Step ''
-Write-Step 'Done. Two things the installer cannot do for you:'
+Write-Step 'Done. Three things the installer cannot do for you:'
 Write-Step ''
 Write-Step '  1. Pin it to the taskbar. Windows 11 has no supported way for a script'
 Write-Step '     to pin an item, so do it once by hand:'
 Write-Step '       Start menu -> search "DSH Web" -> right click -> More -> Pin to taskbar'
 Write-Step '     (or drag the desktop shortcut onto the taskbar).'
-Write-Step '  2. If you want `dsh web` itself to open the Chrome app window - not just'
+Write-Step '  2. Use "DSH Web (Restart)" when the GUI must reload the server - after'
+Write-Step '     changing a plugin, for example. The plain "DSH Web" icon only opens'
+Write-Step '     what is already running; it never restarts anything.'
+Write-Step '  3. If you want `dsh web` itself to open the Chrome app window - not just'
 Write-Step '     the shortcuts - install the plugin part as well:'
 Write-Step '       npm i -g pnpm          # once, only if pnpm is missing'
 Write-Step '       dsh plugin --profile web add <this-repo-or-package>'

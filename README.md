@@ -114,7 +114,9 @@ dsh plugin --profile web remove dsh-web-desktop
 
 ## 安装方式 B：Windows 启动器（推荐给想"点图标就用"的人）
 
-装上之后，开始菜单 / 桌面会出现 **DSH Web**（打开）和 **DSH Web (Stop)**（停止）两个入口；点击后在后台起服务，界面以 Chrome App 窗口打开。
+装上之后，开始菜单会出现 **DSH Web**（打开）、**DSH Web (Restart)**（重启）、**DSH Web (Stop)**（停止）三个入口，桌面会出现 **DSH Web** 和 **DSH Web (Restart)** 两个入口；点击后在后台起服务，界面以 Chrome App 窗口打开。
+
+> **重启为什么要单独一个图标**：普通图标在服务已经在跑时只会把界面打开，不会重启。想让 dsh 重新加载插件（改了插件代码、装了新插件）就必须重启服务，而这件事不能要求用户去开命令行 —— 所以**重启有一个桌面图标**，双击即可，脚本会先确认占用端口的是 dsh 自己（node），再停服务、等服务真正释放端口、然后重新起，最后开界面。
 
 ```powershell
 git clone https://github.com/<YOUR_GITHUB_USER>/dsh-web-desktop
@@ -167,9 +169,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\windows\install.ps1
 
 1. 端口空闲 → 后台静默启动 `dsh web`（不弹黑窗口），**超过 2 秒**会显示一张居中的等待卡片（当前阶段 + 已等待秒数），界面交给浏览器后卡片自动消失；
 2. 端口上已经有 dsh 在跑 → 不重复启动，直接用记下来的带 token 地址打开界面；
-3. 端口被**别的程序**占用 → 弹窗提示，不会瞎启动。
+3. 端口被**别的程序**占用 → 弹窗提示，不会瞎启动；
+4. 加了 `-Restart` → 先停掉端口上的 dsh（确认是 node 才动手），**等端口真正释放**再重新启动，最后开界面。
 
 **停止**：点 **DSH Web (Stop)**（或命令行 `-Stop`）。
+**重启**：点 **DSH Web (Restart)**（或命令行 `-Restart`）—— 改了插件、想重新加载时用这个。
+
+> 等待卡片里的进度条由一张自绘控件的**自己的定时器**驱动（约 60 fps 平滑往返 + 缓动），不依赖 PowerShell 主循环去"喂"它绘制。原来的写法是在轮询循环里 `DoEvents()` + 每 15ms 重算一次位置，循环一忙（探端口、等进程退出）进度条就卡成"一秒跳一下"。
 
 **日志**在启动器目录的 `logs\` 下：
 
@@ -192,6 +198,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.dsh\launc
 | 参数 | 说明 |
 |---|---|
 | `-Stop` | 停止监听该端口的 dsh 进程（会先确认占用者是 node，不会误杀别的程序） |
+| `-Restart` | 先停掉该端口上的 dsh、等端口释放，再重新启动并打开界面（桌面"重启"图标用的就是这个） |
 | `-Check` | 只打印诊断信息 |
 | `-Port <端口>` | 默认 3080 |
 | `-Workspace <路径>` | 默认 `%USERPROFILE%` |
