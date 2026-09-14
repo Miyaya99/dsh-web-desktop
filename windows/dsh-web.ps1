@@ -78,59 +78,47 @@ function Show-Message([string]$Text, [string]$Title = 'DSH Web', [int]$Icon = 64
     try { (New-Object -ComObject WScript.Shell).Popup($Text, $Seconds, $Title, $Icon) | Out-Null } catch { }
 }
 
-# A three-button WScript popup: the buttons cannot be renamed, but one prompt
-# says exactly which one means what, and a second click is a dialog rather than
-# a silent decision made for the user.
+# Shows the choice card and returns the C# answer code: 1 restart, 2 open,
+# 0 cancel. The only place that builds the dialog.
+function Ask-ChoiceCard([int]$Port) {
+    Initialize-CardTypes
+    $owner = $null
+    if ($script:Splash -and $script:Splash.Form) { $owner = $script:Splash.Form }
+    $dialog = New-Object DshChoiceCard
+    if ($owner) { $dialog.Owner = $owner }
+    try {
+        return [int]$dialog.Ask()
+    } finally {
+        $dialog.Dispose()
+    }
+}
+# The choice card asks a different question than a plain message box: a second
+# click on the icon either restarts the server or opens another window, and
+# nothing about the icon says which. Yes is the default because a repeat click
+# usually follows a plugin change.
 function Ask-Action([int]$Port) {
     if ($Quiet) { return 'open' }              # installer/uninstaller: never prompt
     if ($Restart) { return 'restart' }
     if ($New) { return 'open' }
     if ($NoPrompt) { return 'open' }
-    $text = @(
-        "DSH Web is already running on port $Port."
-        ''
-        'YES  - Restart it (closes the server, then starts it again)'
-        '         Choose this after changing a plugin.'
-        'NO   - Keep it running and open another window'
-        'CANCEL - Do nothing'
-    ) -join "`r`n"
-    # NoButtons = 0, Question = 32, Yes is the default; the deadline means an
-    # ignored dialog can never leave a hidden launcher waiting forever.
-    try {
-        $answer = (New-Object -ComObject WScript.Shell).Popup($text, 25, 'DSH Web', 32)
-    } catch {
-        Write-Log "ask: dialog failed ($($_.Exception.Message)); opening instead"
-        return 'open'
-    }
-    switch ([int]$answer) {
-        6 { return 'restart' }   # Yes
-        7 { return 'open' }      # No
-        2 { return 'cancel' }    # Cancel
-        -1 { return 'open' }     # timed out
-        default { return 'open' }
+    switch (Ask-ChoiceCard $Port) {
+        1 { return 'restart' }
+        2 { return 'open' }
+        default { return 'cancel' }
     }
 }
 
-# --- startup splash ----------------------------------------------------------
-# A small topmost card shown only when booting takes long enough to need
-# feedback; it closes itself once the URL has been handed to the browser.
-$script:Splash = $null
-$SplashDelaySeconds = 2
-
-function Initialize-Splash {
-    $script:Splash = $null
-    try {
-        Add-Type -AssemblyName System.Windows.Forms
-        Add-Type -AssemblyName System.Drawing
-        if (-not ('DshSplashForm' -as [type]) -or -not ('DshWaitCard' -as [type])) {
-            # WinForms gives no property for these two: without them the card
-            # would steal focus from whatever the user is typing in, and would
-            # add a taskbar button of its own.
-            Add-Type -ReferencedAssemblies 'System.Windows.Forms', 'System.Drawing' -TypeDefinition @'
+# --- shared WinForms card source --------------------------------------------
+# The splash card and the choice dialog are compiled from this one string: an
+# earlier revision pasted the whole thing into both call sites, and the copies
+# silently drifted apart. Kept as a single-quoted here-string (no interpolation
+# of the C# below) and compiled whenever either entry point needs it.
+$script:CardSource = @'
 using System;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
 public class DshSplashForm : Form {
@@ -156,7 +144,15 @@ public class DshWaitCard : Control {
     private readonly string[] shimmer = new string[] { ".", "..", "..." };
     private string line1 = "";
     private string line2 = "";
+    private string headline = "DeepSeek Harness";
     private int shimmerStep;
+
+    // The product name is the default headline; the choice dialog reuses the
+    // same card for its own question, so it has to be settable.
+    public string Headline {
+        get { return headline; }
+        set { headline = value == null ? "" : value; Invalidate(); }
+    }
 
     public DshWaitCard() {
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint
@@ -193,7 +189,7 @@ public class DshWaitCard : Control {
         using (SolidBrush dim = new SolidBrush(Color.FromArgb(166, 176, 202)))
         using (Font bold = new Font("Segoe UI", 13f, FontStyle.Bold))
         using (Font small = new Font("Segoe UI", 9f)) {
-            g.DrawString("DeepSeek Harness", bold, fg, left, 32);
+            g.DrawString(headline, bold, fg, left, 32);
             g.DrawString(line1 + shimmer[shimmerStep % 3], small, dim, left + 1, 66);
         }
 
@@ -257,10 +253,213 @@ public class DshWaitCard : Control {
         base.Dispose(disposing);
     }
 }
-'@
-        }
-        try { [System.Windows.Forms.Application]::EnableVisualStyles() } catch { }
+// The choice card. WScript.Shell.Popup would be shorter, but it renders only a
+// single OK button on some systems regardless of the requested button set, and
+// it always draws the stock grey message box. This one is a real dark modal
+// with three buttons whose captions and order are ours.
+public class DshChoiceCard : DshSplashForm {
+    public const int Restart = 1;
+    public const int Open = 2;
+    public const int Cancel = 0;
 
+    public int Choice = Cancel;
+
+    private readonly Label status = new Label();
+    private readonly Timer poll = new Timer();
+
+    // No formal parameter for the owner: PowerShell's New-Object cannot match a
+    // constructor that takes an interface when the argument is $null, so the
+    // card is built first and the owner assigned afterwards.
+    public DshChoiceCard() {
+        Text = "DSH Web";
+        FormBorderStyle = FormBorderStyle.None;
+        StartPosition = FormStartPosition.CenterScreen;
+        TopMost = true;
+        ShowInTaskbar = true;
+        ClientSize = new Size(468, 224);
+        BackColor = Color.FromArgb(23, 26, 36);
+        KeyPreview = true;
+
+        DshWaitCard card = new DshWaitCard();
+        card.Dock = DockStyle.Fill;
+        card.BackColor = BackColor;
+        card.SetText("", "");
+        Controls.Add(card);
+
+        // The question is the card's own text: the card is a brand header there,
+        // and repeating "DeepSeek Harness" underneath it read as a glitch.
+        Label question = new Label();
+        question.Text = "Restart the server, or open another window?";
+        question.Font = new Font("Segoe UI", 10f);
+        question.ForeColor = Color.FromArgb(226, 232, 246);
+        question.BackColor = Color.Transparent;
+        question.AutoSize = true;
+        question.Location = new Point(28, 112);
+        Controls.Add(question);
+        question.BringToFront();
+
+        status.Font = new Font("Segoe UI", 9f);
+        status.ForeColor = Color.FromArgb(166, 176, 202);
+        status.BackColor = Color.Transparent;
+        status.AutoSize = false;
+        status.TextAlign = ContentAlignment.MiddleCenter;
+        status.Location = new Point(0, 192);
+        status.Size = new Size(468, 20);
+        Controls.Add(status);
+        status.BringToFront();
+
+        Button restart = MakeButton("Restart server", 28, 148, 138);
+        restart.BackColor = Color.FromArgb(111, 155, 255);
+        restart.ForeColor = Color.FromArgb(16, 20, 32);
+        restart.Click += delegate { Answer(Restart); };
+        Controls.Add(restart);
+        restart.BringToFront();
+
+        Button open = MakeButton("New window", 174, 148, 128);
+        open.BackColor = Color.FromArgb(43, 49, 69);
+        open.ForeColor = Color.FromArgb(226, 232, 246);
+        open.Click += delegate { Answer(Open); };
+        Controls.Add(open);
+        open.BringToFront();
+
+        Button cancel = MakeButton("Cancel", 310, 148, 100);
+        cancel.BackColor = Color.FromArgb(43, 49, 69);
+        cancel.ForeColor = Color.FromArgb(166, 176, 202);
+        cancel.Click += delegate { Answer(Cancel); };
+        Controls.Add(cancel);
+        cancel.BringToFront();
+
+        // Restart is the default: a repeat click usually follows a plugin change.
+        AcceptButton = restart;
+        CancelButton = cancel;
+
+        // The countdown must not depend on the launcher: it is blocked waiting
+        // for this dialog, so nothing else would ever decrement it.
+        poll.Interval = 500;
+        poll.Tick += delegate {
+            int tick = 25;
+            object tag = status.Tag;
+            if (tag is int) tick = (int)tag;
+            tick--;
+            status.Tag = tick;
+            if (tick <= 0) {
+                Answer(Cancel);
+                return;
+            }
+            status.Text = "Nothing happens if you do not choose (" + tick + "s)";
+        };
+    }
+
+    private static Button MakeButton(string caption, int x, int y, int width) {
+        Button button = new Button();
+        button.Text = caption;
+        button.Font = new Font("Segoe UI", 9f);
+        button.FlatStyle = FlatStyle.Flat;
+        button.FlatAppearance.BorderSize = 0;
+        button.Location = new Point(x, y);
+        button.Size = new Size(width, 32);
+        button.TabStop = true;
+        return button;
+    }
+
+    private void Answer(int choice) {
+        Choice = choice;
+        poll.Stop();
+        Close();
+    }
+
+    public int Ask() {
+        // Start the countdown before the modal loop takes over; ShowDialog runs
+        // its own message loop, so the timer keeps ticking without any help
+        // from the launcher (which is blocked right here).
+        status.Text = "Nothing happens if you do not choose (25s)";
+        status.Tag = 25;
+        poll.Start();
+        try { DisplayStyle(); } catch { }
+        // Owner is unset when there is no splash card to hang this off, in which
+        // case ShowDialog still centres the dialog on the screen.
+        if (Owner != null) { ShowDialog(Owner); } else { ShowDialog(); }
+        poll.Stop();
+        return Choice;
+    }
+
+    // A dark title bar and rounded corners, asked for by attribute so a build
+    // without the API simply keeps the default window chrome.
+    private void DisplayStyle() {
+        try {
+            object wsh = Activator.CreateInstance(Type.GetTypeFromProgID("WScript.Shell"));
+            string exe = (string)wsh.GetType().InvokeMember("ExpandEnvironmentStrings",
+                System.Reflection.BindingFlags.InvokeMethod, null, wsh,
+                new object[] { "%SystemRoot%\\System32\\dwmapi.dll" });
+            IntPtr dwm = LoadLibrary(exe);
+            if (dwm == IntPtr.Zero) return;
+            int value = 2;
+            IntPtr p = Marshal.AllocHGlobal(4);
+            Marshal.WriteInt32(p, value);
+            DwmSetWindowAttribute(Handle, 20, p, 4); // DWMWA_USE_IMMERSIVE_DARK_MODE
+            DwmSetWindowAttribute(Handle, 19, p, 4); // ...and its pre-20H1 number
+            Marshal.FreeHGlobal(p);
+            FreeLibrary(dwm);
+        } catch { }
+    }
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Auto)]
+    private static extern IntPtr LoadLibrary(string path);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    private static extern bool FreeLibrary(IntPtr module);
+
+    [System.Runtime.InteropServices.DllImport("dwmapi.dll")]
+    private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, IntPtr value, int size);
+
+    // The launcher is hidden, so without this a stray click elsewhere would
+    // leave the dialog behind other windows and look like a hang.
+    protected override void OnActivated(EventArgs e) {
+        base.OnActivated(e);
+        TopMost = true;
+    }
+
+    protected override void OnHandleCreated(EventArgs e) {
+        base.OnHandleCreated(e);
+        // Rounded corners to match the card, once the handle exists.
+        try {
+            int radius = 16;
+            int w = ClientSize.Width;
+            int h = ClientSize.Height;
+            System.Drawing.Drawing2D.GraphicsPath path = new System.Drawing.Drawing2D.GraphicsPath();
+            path.AddArc(0, 0, radius, radius, 180, 90);
+            path.AddArc(w - radius, 0, radius, radius, 270, 90);
+            path.AddArc(w - radius, h - radius, radius, radius, 0, 90);
+            path.AddArc(0, h - radius, radius, radius, 90, 90);
+            path.CloseFigure();
+            Region = new Region(path);
+        } catch { }
+    }
+
+    protected override void Dispose(bool disposing) {
+        if (disposing) { poll.Stop(); poll.Dispose(); }
+        base.Dispose(disposing);
+    }
+}
+'@
+
+function Initialize-CardTypes {
+    # Declaring the classes once per PowerShell session is enough; Add-Type
+    # throws if the same type name is compiled twice.
+    if ('DshChoiceCard' -as [type]) { return }
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+    $referenced = @('System.Windows.Forms', 'System.Drawing')
+    if (-not ('DshSplashForm' -as [type])) {
+        Add-Type -ReferencedAssemblies $referenced -TypeDefinition $script:CardSource
+    }
+    if (-not ('DshChoiceCard' -as [type])) { throw 'the WinForms card types did not compile' }
+}
+
+function Initialize-Splash {
+    $script:Splash = $null
+    try {
+        Initialize-CardTypes
         $width = 384
         $height = 150
         $form = New-Object DshSplashForm
