@@ -71,8 +71,10 @@ $shell = New-Object -ComObject WScript.Shell
 $shortcuts = @()
 if ($startMenu) {
     $shortcuts += (Join-Path $startMenu 'DSH Web.lnk')
-    $shortcuts += (Join-Path $startMenu 'DSH Web (Restart).lnk')
     $shortcuts += (Join-Path $startMenu 'DSH Web (Stop).lnk')
+    # Shipped by an earlier version; listed so upgrading users still get it
+    # cleaned up if the installer never ran again.
+    $shortcuts += (Join-Path $startMenu 'DSH Web (Restart).lnk')
 }
 if ($desktop) {
     $shortcuts += (Join-Path $desktop 'DSH Web.lnk')

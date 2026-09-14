@@ -13,8 +13,10 @@
       .\windows\install.ps1 -NoDesktopShortcut
       .\windows\uninstall.ps1                        remove everything again
 
-    Creates "DSH Web" (open) and "DSH Web (Restart)" (stop, then start again)
-    shortcuts, so restarting never needs a command line.
+    Creates a "DSH Web" shortcut (desktop + Start menu) that starts the server,
+    and a "DSH Web (Stop)" one. Clicking "DSH Web" while the server is already
+    running asks whether to restart it or open another window, so restarting
+    never needs a command line.
 
     Every string here is ASCII on purpose: Windows PowerShell 5.1 reads
     BOM-less .ps1 files as ANSI, so non-ASCII text would corrupt on machines
@@ -120,15 +122,25 @@ function New-LauncherShortcut {
 
 if (-not $NoStartMenuShortcut) {
     New-LauncherShortcut -Path (Join-Path $startMenu 'DSH Web.lnk') -ExtraArgs '' -Description 'Open the DeepSeek Harness web GUI'
-    New-LauncherShortcut -Path (Join-Path $startMenu 'DSH Web (Restart).lnk') -ExtraArgs '-Restart' -Description 'Restart the DeepSeek Harness web server'
     New-LauncherShortcut -Path (Join-Path $startMenu 'DSH Web (Stop).lnk') -ExtraArgs '-Stop' -Description 'Stop the DeepSeek Harness web GUI'
 }
 if (-not $NoDesktopShortcut) {
     New-LauncherShortcut -Path (Join-Path $desktop 'DSH Web.lnk') -ExtraArgs '' -Description 'Open the DeepSeek Harness web GUI'
-    # A restart must be reachable without a command line: the plain icon only
-    # opens what is already running, so anyone who cannot run `dsh-web.ps1
-    # -Stop` would otherwise have no way to reload a changed plugin.
-    New-LauncherShortcut -Path (Join-Path $desktop 'DSH Web (Restart).lnk') -ExtraArgs '-Restart' -Description 'Restart the DeepSeek Harness web server'
+}
+
+# One icon, one decision. An earlier version shipped a separate "DSH Web
+# (Restart)" shortcut, and a second entry that does something the first one
+# already offers only makes people choose before they know the difference.
+# Remove it so re-running the installer cannot leave both behind.
+$legacy = @(
+    (Join-Path $desktop 'DSH Web (Restart).lnk'),
+    (Join-Path $startMenu 'DSH Web (Restart).lnk')
+)
+foreach ($old in $legacy) {
+    if ($old -and (Test-Path $old)) {
+        Remove-Item $old -Force
+        Write-Step ("  removed obsolete shortcut {0}" -f $old)
+    }
 }
 
 # ---- smoke test --------------------------------------------------------------
@@ -149,9 +161,9 @@ Write-Step '  1. Pin it to the taskbar. Windows 11 has no supported way for a sc
 Write-Step '     to pin an item, so do it once by hand:'
 Write-Step '       Start menu -> search "DSH Web" -> right click -> More -> Pin to taskbar'
 Write-Step '     (or drag the desktop shortcut onto the taskbar).'
-Write-Step '  2. Use "DSH Web (Restart)" when the GUI must reload the server - after'
-Write-Step '     changing a plugin, for example. The plain "DSH Web" icon only opens'
-Write-Step '     what is already running; it never restarts anything.'
+Write-Step '  2. Click "DSH Web" while the server is already running and it asks'
+Write-Step '     whether to restart it or open another window. Choose Restart after'
+Write-Step '     changing a plugin; the server must reload for the change to apply.'
 Write-Step '  3. If you want `dsh web` itself to open the Chrome app window - not just'
 Write-Step '     the shortcuts - install the plugin part as well:'
 Write-Step '       npm i -g pnpm          # once, only if pnpm is missing'

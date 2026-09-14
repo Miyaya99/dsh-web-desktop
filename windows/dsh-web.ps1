@@ -1,23 +1,34 @@
 <#
     dsh-web-desktop launcher (Windows).
 
-      dsh-web.ps1                 start dsh web in the background, then open the GUI
+      dsh-web.ps1                 start dsh web, then open the GUI
       dsh-web.ps1 -Restart        stop the running server first, then start it again
+      dsh-web.ps1 -New            leave the running server alone, open another window
       dsh-web.ps1 -Stop           stop the dsh web server listening on the port
       dsh-web.ps1 -Check          print diagnostics only, change nothing
+
+    When a server is already listening, the bare invocation asks what to do -
+    restart it, or open another window - because those are the only two things a
+    second click can sensibly mean, and a desktop icon has no arguments to say
+    which one was wanted. -Restart, -New and -NoPrompt answer it in advance.
 
     Started by the shortcuts this project installs. Logs live in .\logs next to
     this file. The GUI opens as a Chrome app window: no address bar, its own
     taskbar button, and the DeepSeek Harness icon on it.
 
-    Every string in this file is ASCII on purpose: Windows PowerShell 5.1 reads
-    BOM-less .ps1 files as ANSI, so non-ASCII text here would corrupt for anyone
-    whose code page differs.
+    Every string in this file must stay ASCII: the shortcuts run powershell.exe
+    (Windows PowerShell 5.1), which reads a BOM-less .ps1 as ANSI, and the
+    installer writes this file back with a BOM-less UTF8 encoding - so non-ASCII
+    text here would corrupt on any machine whose code page differs. That is why
+    the dialogs below are English, including the wording of the two-button
+    choice.
 #>
 [CmdletBinding()]
 param(
     [switch]$Stop,
     [switch]$Restart,
+    [switch]$New,
+    [switch]$NoPrompt,
     [switch]$Check,
     [switch]$NoBrowser,
     [switch]$NoAppMode,
@@ -65,6 +76,39 @@ function Show-Message([string]$Text, [string]$Title = 'DSH Web', [int]$Icon = 64
     # The popup is modal: give it a deadline so a click can never leave the
     # launcher (and a following click) hanging on a dialog nobody dismissed.
     try { (New-Object -ComObject WScript.Shell).Popup($Text, $Seconds, $Title, $Icon) | Out-Null } catch { }
+}
+
+# A three-button WScript popup: the buttons cannot be renamed, but one prompt
+# says exactly which one means what, and a second click is a dialog rather than
+# a silent decision made for the user.
+function Ask-Action([int]$Port) {
+    if ($Quiet) { return 'open' }              # installer/uninstaller: never prompt
+    if ($Restart) { return 'restart' }
+    if ($New) { return 'open' }
+    if ($NoPrompt) { return 'open' }
+    $text = @(
+        "DSH Web is already running on port $Port."
+        ''
+        'YES  - Restart it (closes the server, then starts it again)'
+        '         Choose this after changing a plugin.'
+        'NO   - Keep it running and open another window'
+        'CANCEL - Do nothing'
+    ) -join "`r`n"
+    # NoButtons = 0, Question = 32, Yes is the default; the deadline means an
+    # ignored dialog can never leave a hidden launcher waiting forever.
+    try {
+        $answer = (New-Object -ComObject WScript.Shell).Popup($text, 25, 'DSH Web', 32)
+    } catch {
+        Write-Log "ask: dialog failed ($($_.Exception.Message)); opening instead"
+        return 'open'
+    }
+    switch ([int]$answer) {
+        6 { return 'restart' }   # Yes
+        7 { return 'open' }      # No
+        2 { return 'cancel' }    # Cancel
+        -1 { return 'open' }     # timed out
+        default { return 'open' }
+    }
 }
 
 # --- startup splash ----------------------------------------------------------
@@ -452,63 +496,33 @@ if ($Stop) {
     }
 }
 
-# --- restart -----------------------------------------------------------------
-# What the desktop icon runs: stop whatever is serving the port, then start
-# again from scratch. This is the only way to pick up a plugin change without a
-# command line, so it must not require one.
+# --- already running: restart, or open another window? -----------------------
+# A server is on the port. Restarting it and opening another window are the only
+# two things a second click can sensibly mean, so if nothing said which one was
+# wanted, ask. Either way confirm it is really dsh first: dsh answers 401 (and
+# 403 on a rejected Host) without a browser cookie, and anything else on this
+# port belongs to a different program.
 $restarting = $false
-if ($Restart -and $running) {
-    # Only restart our own server: a stranger on this port must never be killed.
-    $stillDsh = $false
-    try {
-        $probe = Invoke-WebRequest $Url -UseBasicParsing -TimeoutSec 5
-        Write-Log "restart: port $Port answered $([int]$probe.StatusCode); not a dsh server"
-    } catch {
-        $probeResponse = $_.Exception.Response
-        if ($probeResponse) {
-            $code = [int]$probeResponse.StatusCode
-            if ($code -eq 401 -or $code -eq 403) { $stillDsh = $true }
-            else { Write-Log "restart: port $Port answered $code; not a dsh server" }
-        }
-    }
-    if (-not $stillDsh) {
-        Write-Log "restart: refused - port $Port is taken by another program (PID $owner)"
-        Show-Message "Port $Port is already used by another program (PID $owner), so DSH Web cannot start.`r`n`r`nClose that program, or start this launcher with another -Port." 'DSH Web' 16 45
-        exit 1
-    }
-    Initialize-Splash
-    Set-Splash 'Restarting the server' ''
-    Write-Log "restart: stopping the server on port $Port"
-    if ((Stop-DshServer) -eq 'blocked') {
-        Close-Splash
-        Show-Message "Could not stop the dsh server on port $Port.`r`n`r`nEnd PID $owner in Task Manager and try again." 'DSH Web' 48 30
-        exit 1
-    }
-    $restarting = $true
-    # The port is free now, so the start path below must not take its
-    # "already running, just reuse it" branch.
-    $running = $false
-    $owner = 0
-}
+$splashVisible = $false
+$forceReload = $false
+$openTarget = $Url
 
-# --- start -------------------------------------------------------------------
 if ($running) {
-    # A server is already serving this port. Confirm it is dsh (it answers 401
-    # without a browser cookie) and reuse it instead of failing to bind.
-    # dsh answers 401 (and 403 on a rejected Host) without a browser cookie;
-    # anything else on this port belongs to a different program.
+    $action = Ask-Action $Port
+    if ($action -eq 'cancel') { Write-Log 'ask: user chose to do nothing'; exit 0 }
+
     $isDsh = $false
     try {
         $response = Invoke-WebRequest $Url -UseBasicParsing -TimeoutSec 5
-        Write-Log "reuse: port $Port answered $([int]$response.StatusCode); not a dsh server"
+        Write-Log "probe: port $Port answered $([int]$response.StatusCode); not a dsh server"
     } catch {
         $response = $_.Exception.Response
         if ($response) {
             $code = [int]$response.StatusCode
             if ($code -eq 401 -or $code -eq 403) { $isDsh = $true }
-            else { Write-Log "reuse: port $Port answered $code; not a dsh server" }
+            else { Write-Log "probe: port $Port answered $code; not a dsh server" }
         } else {
-            Write-Log "reuse: port $Port probe failed: $($_.Exception.Message)"
+            Write-Log "probe: port $Port probe failed: $($_.Exception.Message)"
         }
     }
     if (-not $isDsh) {
@@ -518,13 +532,43 @@ if ($running) {
     }
     # Prefer the token URL recorded by the last launch: it authenticates even a
     # browser that has no cookie for this server yet.
-    $target = $Url
     if (Test-Path $UrlFile) {
         $stored = (Get-Content $UrlFile -Raw).Trim()
-        if ($stored -match "^http://127\.0\.0\.1:$Port/\?token=\S+$") { $target = $stored }
+        if ($stored -match "^http://127\.0\.0\.1:$Port/\?token=\S+$") { $openTarget = $stored }
     }
-    Write-Log "reuse: port $Port already serving (PID $owner); opening $target"
-    Open-Gui $target
+
+    if ($action -eq 'restart') {
+        Write-Log "restart: stopping the server on port $Port"
+        # Show the card up front: the stop alone takes a second or more, and
+        # waiting for the usual 2s delay would leave the click unanswered.
+        Initialize-Splash
+        $splashVisible = $true
+        Set-Splash 'Restarting the server' ''
+        if ((Stop-DshServer) -eq 'blocked') {
+            Close-Splash
+            Show-Message "Could not stop the dsh server on port $Port.`r`n`r`nEnd PID $owner in Task Manager and try again." 'DSH Web' 48 30
+            exit 1
+        }
+        $restarting = $true
+        $forceReload = $true
+        $running = $false
+        $owner = 0
+    } else {
+        # Opening a window into a running server is quick, so the card appears
+        # at once (no 2s delay) and disappears again right after.
+        $splashVisible = $true
+        Set-Splash 'Opening the interface' ''
+    }
+}
+
+# --- start -------------------------------------------------------------------
+if ($running) {
+    Write-Log "reuse: port $Port already serving (PID $owner); opening $openTarget"
+    if ($forceReload) { $openTarget += "&dsh_reload=$([int](Get-Date -UFormat %s))" }
+    Set-Splash 'Opening the interface' ''
+    Open-Gui $openTarget
+    Wait-Pumping 900
+    Close-Splash
     exit 0
 }
 
@@ -564,7 +608,7 @@ $startedAt = Get-Date
 $deadline = $startedAt.AddSeconds(45)
 while ((Get-Date) -lt $deadline) {
     $waited = [int]((Get-Date) - $startedAt).TotalSeconds
-    if (-not $script:Splash -and ($restarting -or $waited -ge $SplashDelaySeconds)) { Initialize-Splash }
+    if (-not $script:Splash -and ($splashVisible -or $waited -ge $SplashDelaySeconds)) { Initialize-Splash }
     # On a restart the card is already up and reads "Restarting": leave it alone
     # for the first second, then switch to the plain elapsed count.
     if (-not $restarting -or $waited -ge 1) { Set-Splash 'Starting the server' "${waited}s" }
