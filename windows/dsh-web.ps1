@@ -5,6 +5,7 @@
       dsh-web.ps1 -Restart        stop the running server first, then start it again
       dsh-web.ps1 -New            leave the running server alone, open another window
       dsh-web.ps1 -Stop           stop the dsh web server listening on the port
+      dsh-web.ps1 -Uninstall      remove the shortcuts, the server and this install
       dsh-web.ps1 -Check          print diagnostics only, change nothing
 
     When a server is already listening, the bare invocation asks what to do -
@@ -30,6 +31,7 @@ param(
     [switch]$New,
     [switch]$NoPrompt,
     [switch]$Check,
+    [switch]$Uninstall,
     [switch]$NoBrowser,
     [switch]$NoAppMode,
     [switch]$Quiet,
@@ -720,6 +722,47 @@ if ($Check) {
     exit 0
 }
 
+# --- uninstall ----------------------------------------------------------------
+# What the Start menu's "Uninstall" entry runs. The launcher is the one file
+# guaranteed to be present next to the uninstaller, so it is the natural entry
+# point: a shortcut pointing straight at uninstall.ps1 would break the moment the
+# install directory went away.
+if ($Uninstall) {
+    # Hand off to the uninstaller and exit at once: it has to delete the
+    # directory this script is running from, and it can only do that once nothing
+    # is executing from there. Copying both scripts to %TEMP% first is what makes
+    # the install directory removable at all.
+    $payload = @('dsh-web.ps1', 'uninstall.ps1', 'dsh-web.ico', 'dsh-web.png', 'install.json')
+    $tempDir = Join-Path $env:TEMP ('dsh-web-uninstall-' + [Guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
+    foreach ($name in $payload) {
+        $source = Join-Path $Root $name
+        if (Test-Path $source) { Copy-Item $source (Join-Path $tempDir $name) -Force }
+    }
+    $staged = Join-Path $tempDir 'uninstall.ps1'
+    if (-not (Test-Path $staged)) {
+        # Falling back to the copied launcher still removes the shortcuts and the
+        # server; only the directory itself may be left behind.
+        Write-Log "uninstall: uninstall.ps1 missing, using the staged launcher at $tempDir"
+        $staged = Join-Path $tempDir 'dsh-web.ps1'
+    }
+    Write-Log "uninstall: handing off to $staged (install dir $Root)"
+    $powershell = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
+    try {
+        # A visible console: the uninstaller reports what it removes there, and
+        # the user asked for this so it should not happen invisibly.
+        Start-Process -FilePath $powershell -ArgumentList @(
+            '-NoProfile', '-ExecutionPolicy', 'Bypass',
+            '-File', $staged, '-InstallDir', $Root
+        ) -WorkingDirectory $tempDir
+    } catch {
+        Write-Log "uninstall: could not start the uninstaller - $($_.Exception.Message)"
+        Show-Message "Could not start the uninstaller:`r`n$($_.Exception.Message)" 'DSH Web' 16 45
+        exit 1
+    }
+    exit 0
+}
+
 # --- stop --------------------------------------------------------------------
 # The process holding the port, or $null when nothing does. Used both to decide
 # whether the running server is ours and to report a refusal.
@@ -935,6 +978,12 @@ Write-Log "start: launched PID $($process.Id)"
 # Watch for the port on another thread, so the loop below never blocks. See
 # DshPortWatcher: the old inline probe cost ~520 ms per call and made the
 # progress card stutter.
+#
+# The card types must be compiled before the watcher is constructed: on a cold
+# start nothing has needed a card yet, and New-Object would fail with "Cannot
+# find type [DshPortWatcher]". The restart path got away with it because the
+# card already existed by then.
+Initialize-CardTypes
 $readyFlag = Join-Path $env:TEMP "dsh-web-ready-$Port-$PID.flag"
 Remove-Item $readyFlag -ErrorAction SilentlyContinue
 $watcher = New-Object DshPortWatcher -ArgumentList $Port, $readyFlag

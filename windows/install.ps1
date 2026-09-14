@@ -58,6 +58,7 @@ $psExe = Join-Path $systemDir 'WindowsPowerShell\v1.0\powershell.exe'
 
 foreach ($pair in @(
     @('launcher source', (Join-Path $sourceWindows 'dsh-web.ps1')),
+    @('uninstaller source', (Join-Path $sourceWindows 'uninstall.ps1')),
     @('icon source', (Join-Path $sourceAssets 'dsh-web.ico')),
     @('logo source', (Join-Path $sourceAssets 'dsh-web.png')),
     @('powershell.exe', $psExe)
@@ -76,8 +77,12 @@ Write-Step ''
 
 # ---- payload -----------------------------------------------------------------
 New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+# uninstall.ps1 ships alongside the launcher on purpose: the "Uninstall" item in
+# the Start menu's right-click menu (and the launcher's -Uninstall switch) has to
+# work without the repository this was installed from.
 $payload = @(
     @((Join-Path $sourceWindows 'dsh-web.ps1'), 'dsh-web.ps1'),
+    @((Join-Path $sourceWindows 'uninstall.ps1'), 'uninstall.ps1'),
     @((Join-Path $sourceAssets 'dsh-web.ico'), 'dsh-web.ico'),
     @((Join-Path $sourceAssets 'dsh-web.png'), 'dsh-web.png')
 )
@@ -119,6 +124,53 @@ function New-LauncherShortcut {
     $script:created += $Path
     Write-Step ("  shortcut {0}" -f $Path)
 }
+
+# ---- register as an installed application ------------------------------------
+# Windows only offers "Uninstall" in a Start menu entry's right-click menu for
+# programs it knows about, and it learns about them from this key. Registering
+# here is what makes that menu item appear; HKCU needs no administrator rights
+# and is enough for the current user.
+function Add-AppRegistration {
+    param([string]$InstallDir, [string]$Launcher, [string]$Uninstaller, [string]$Icon)
+
+    $powershell = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
+    $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\DSH Web'
+
+    # Uninstall runs the uninstaller, which stops the server on the recorded
+    # port, removes the shortcuts and deletes the install directory.
+    $uninstall = '"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -InstallDir "{2}"' -f $powershell, $Uninstaller, $InstallDir
+    # Nothing to repair or modify, but keeping the same action means a stray
+    # click on either does the sensible thing.
+    $modify = '"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -InstallDir "{2}"' -f $powershell, $Launcher, $InstallDir
+
+    if (-not (Test-Path $key)) { New-Item -Path $key -Force | Out-Null }
+    $values = @{
+        DisplayName     = 'DSH Web'
+        DisplayVersion  = '1.0.0'
+        Publisher       = 'dsh-web-desktop'
+        InstallLocation = $InstallDir
+        UninstallString = $uninstall
+        QuietUninstallString = $uninstall
+        ModifyPath      = $modify
+        NoModify        = 1
+        NoRepair        = 1
+        EstimatedSize   = [int]((Get-ChildItem $InstallDir -Recurse -File -ErrorAction SilentlyContinue |
+                            Measure-Object -Property Length -Sum).Sum / 1KB)
+    }
+    if (Test-Path $Icon) { $values['DisplayIcon'] = $Icon }
+
+    foreach ($name in $values.Keys) {
+        # The type is an argument to the cmdlet, so decide it before the call.
+        $type = 'String'
+        if ($values[$name] -is [int]) { $type = 'DWord' }
+        New-ItemProperty -Path $key -Name $name -Value $values[$name] -PropertyType $type -Force | Out-Null
+    }
+    Write-Step '  registered as an installed application (right-click the Start menu entry to uninstall)'
+}
+
+# Always register: the application is installed whether or not anyone wanted
+# shortcuts for it, and this is what puts "Uninstall" in a right-click menu.
+Add-AppRegistration -InstallDir $InstallDir -Launcher $launcher -Uninstaller (Join-Path $InstallDir 'uninstall.ps1') -Icon $icon
 
 if (-not $NoStartMenuShortcut) {
     New-LauncherShortcut -Path (Join-Path $startMenu 'DSH Web.lnk') -ExtraArgs '' -Description 'Open the DeepSeek Harness web GUI'

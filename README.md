@@ -116,6 +116,10 @@ dsh plugin --profile web remove dsh-web-desktop
 
 装上之后，开始菜单会出现 **DSH Web**（打开 / 重启）和 **DSH Web (Stop)**（停止）两个入口，桌面上只放一个 **DSH Web**。点击后在后台起服务，界面以 Chrome App 窗口打开。
 
+> **卸载在右键菜单里**：安装脚本会把 DSH Web 注册成一个已安装应用（写 `HKCU\...\CurrentVersion\Uninstall\DSH Web`，不需要管理员权限）。所以在开始菜单里**右键 `DSH Web` → 卸载**即可，会直接触发卸载脚本：停掉服务、删掉快捷方式、注销注册项、删除安装目录。卸载脚本本身也随安装包一起部署到 `%USERPROFILE%\.dsh\launchers\`，所以**不需要当初 clone 的仓库还在**。
+>
+> 为什么需要注册：Windows 只对"它知道的程序"显示这个"卸载"菜单项。没注册之前，右键里根本没有卸载 —— 这也是"没办法卸载"的原因。
+
 > **重复点击会问你要干什么**：服务没在跑时，点图标就是启动；服务**已经在跑**时，会弹出一张深色对话框问你三个选择 —— **Restart server**（先停再起，改了插件用这个）、**New window**（保留当前服务另开一个窗口）、**Cancel**（什么都不做，25 秒不选也按"不动"处理）。默认按钮是 Restart server，直接回车即重启。
 >
 > 对话框是 WinForms 自绘的（和启动等待卡片同一套配色），**不用系统消息框**：实测 `WScript.Shell.Popup` 在这台机器上无论传什么按钮参数都只渲染出一个"确定"，根本没法让用户二选一。自绘对话框的按钮文案、顺序、默认项都是可控的。
@@ -204,6 +208,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.dsh\launc
 | `-Restart` | 直接重启（先停、等端口释放、再起），跳过询问弹窗 |
 | `-New` | 直接另开一个窗口，跳过询问弹窗 |
 | `-NoPrompt` | 服务已在跑时不弹窗，默认按"另开一个窗口"处理（适合脚本调用） |
+| `-Uninstall` | 卸载：把卸载器复制到 `%TEMP%` 后交接过去（否则它删不掉自己所在的目录） |
 | `-Check` | 只打印诊断信息 |
 | `-Port <端口>` | 默认 3080 |
 | `-Workspace <路径>` | 默认 `%USERPROFILE%` |
@@ -316,16 +321,32 @@ dsh plugin --profile web add -w github:<YOUR_GITHUB_USER>/dsh-web-desktop
 
 ## 卸载
 
-```powershell
-# 启动器（会先停掉它自己的服务，再删快捷方式和安装目录）
-powershell -NoProfile -ExecutionPolicy Bypass -File .\windows\uninstall.ps1
-# 想保留日志： -KeepLogs
+**最省事的方式**：开始菜单 → 右键 `DSH Web` → **卸载**。会停掉服务、删掉快捷方式、注销注册项、删除安装目录。
 
-# 插件
-dsh plugin --profile web remove dsh-web-desktop
+命令行方式（等价，适合脚本化）：
+
+```powershell
+# 在仓库里跑（把仓库里的卸载脚本作为入口）
+powershell -NoProfile -ExecutionPolicy Bypass -File .\windows\uninstall.ps1
+
+# 或者用已安装的那份，不依赖仓库
+powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.dsh\launchers\uninstall.ps1"
+
+# 启动器的等价入口
+powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.dsh\launchers\dsh-web.ps1" -Uninstall
+
+# 想保留日志：加 -KeepLogs
 ```
 
-卸载脚本**不会**碰你的 dsh 安装、你的 `~/.dsh` profile，或任何别的插件。
+> 卸载脚本会先把自己（连同启动器、图标）复制到 `%TEMP%` 再执行 —— 否则它正在运行的那个文件会占住安装目录，目录就删不掉。用完的临时副本会留在 `%TEMP%\dsh-web-uninstall-*`，可以随手删。
+
+> 卸载脚本**不会**碰你的 dsh 安装、你的 `~/.dsh` profile，或任何别的插件。它只会停止**它自己那个端口**（从 `install.json` 读，不是硬编码 3080）上的 dsh。
+
+插件部分仍然单独卸载：
+
+```powershell
+dsh plugin --profile web remove dsh-web-desktop
+```
 
 ---
 
